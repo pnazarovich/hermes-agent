@@ -1579,6 +1579,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     _reply_anchor_for_event,
     merge_pending_message_event,
 )
@@ -4170,6 +4171,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
+            else:
+                # A successful steer does not go through BasePlatformAdapter's
+                # normal _process_message_background path, so lifecycle hooks
+                # (Telegram/Discord reactions, etc.) would otherwise be skipped
+                # for this user message. Mark it as in-progress now and defer
+                # the success reaction until the active run delivers its final
+                # response.
+                try:
+                    hook = getattr(adapter, "_run_processing_hook", None)
+                    if callable(hook):
+                        await hook("on_processing_start", event)
+
+                        async def _complete_steered_event() -> None:
+                            await hook(
+                                "on_processing_complete",
+                                event,
+                                ProcessingOutcome.SUCCESS,
+                            )
+
+                        register_cb = getattr(adapter, "register_post_delivery_callback", None)
+                        if callable(register_cb):
+                            generation = None
+                            active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                            if active is not None:
+                                generation = getattr(active, "_hermes_run_generation", None)
+                            register_cb(
+                                session_key,
+                                _complete_steered_event,
+                                generation=generation,
+                            )
+                        else:
+                            await _complete_steered_event()
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to run busy-steer lifecycle hooks for %s: %s",
+                        session_key,
+                        exc,
+                        exc_info=True,
+                    )
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
