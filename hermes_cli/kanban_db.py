@@ -4930,6 +4930,18 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    archived: list[str] = field(default_factory=list)
+    """Done task ids auto-archived this tick because they aged past
+    ``kanban.done_archive_days`` (infra-queue feature 3 / П.3). Empty unless
+    the feature is enabled (default OFF)."""
+    stuck_chains: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` pairs for impl→review chains detected as stuck
+    this tick (infra-queue feature 2 / П.2 layer 2). Alarm only — never
+    auto-fixed. Empty unless ``kanban.stuck_chain_alarm_seconds`` is set."""
+    auto_reworked: list[str] = field(default_factory=list)
+    """Rework card ids auto-created this tick for reviewer-blocked impl
+    chains (infra-queue feature 1 / auto-rework L2). Empty unless
+    ``kanban.auto_rework.enabled`` is true (default OFF)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6112,6 +6124,436 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Infra-queue feature 3: auto-archive stale Done cards (П.3)
+# ---------------------------------------------------------------------------
+
+def _done_has_unfinished_descendants(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return True if ``task_id`` has any child not in a terminal state.
+
+    Terminal = ``done`` or ``archived``. A done parent with a still-active
+    child (running / blocked / ready / todo / review / triage) must NOT be
+    auto-archived — archiving it would prune useful lineage context the
+    in-flight child still needs (see build_worker_context's parent handoff).
+    """
+    rows = conn.execute(
+        "SELECT t.status FROM tasks t "
+        "JOIN task_links l ON l.child_id = t.id "
+        "WHERE l.parent_id = ?",
+        (task_id,),
+    ).fetchall()
+    return any(r["status"] not in ("done", "archived") for r in rows)
+
+
+def auto_archive_old_done(
+    conn: sqlite3.Connection,
+    *,
+    archive_after_days: int = 0,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Archive Done cards whose completion is older than ``archive_after_days``.
+
+    Returns the list of task ids archived this pass. Safe / idempotent: a
+    second call finds nothing because the cards are now ``archived``.
+
+    Guards:
+      * ``archive_after_days <= 0`` → disabled (no-op, returns ``[]``). This
+        is the default so the feature is strictly opt-in.
+      * Only ``status='done'`` cards with a non-NULL ``completed_at`` older
+        than the cutoff are considered.
+      * A done card with any unfinished descendant is skipped (lineage
+        still needed by an in-flight child).
+
+    Each archive reuses :func:`archive_task`, so it emits the standard
+    ``archived`` event and re-runs ``recompute_ready`` for dependents.
+    """
+    try:
+        days = int(archive_after_days)
+    except (TypeError, ValueError):
+        return []
+    if days <= 0:
+        return []
+    now = int(now if now is not None else time.time())
+    cutoff = now - days * 86400
+    candidates = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'done' AND completed_at IS NOT NULL "
+        "    AND completed_at < ? "
+        "ORDER BY completed_at ASC",
+        (cutoff,),
+    ).fetchall()
+    archived: list[str] = []
+    for row in candidates:
+        tid = row["id"]
+        if _done_has_unfinished_descendants(conn, tid):
+            continue
+        if archive_task(conn, tid):
+            archived.append(tid)
+    return archived
+
+
+# ---------------------------------------------------------------------------
+# Infra-queue feature 2: stuck impl->review chain detector (П.2 layer 2)
+# ---------------------------------------------------------------------------
+
+def detect_stuck_chains(
+    conn: sqlite3.Connection,
+    *,
+    threshold_seconds: int = 0,
+    now: Optional[int] = None,
+) -> list[tuple[str, str]]:
+    """Detect impl->review chains stuck longer than ``threshold_seconds``.
+
+    Returns ``(task_id, reason)`` pairs for newly-detected stuck chains and
+    emits a one-shot ``chain_stuck_alarm`` event per stuck card so the
+    notifier / ``hermes kanban tail`` surfaces it. **Alarm only** — never
+    auto-fixes; a human (Petro) resolves the chain.
+
+    A chain is "stuck" when a reviewer-style card is sticky-blocked (an
+    explicit ``kanban_block`` / ``review-required`` handoff) while its
+    impl-parent is already ``done`` — the circular-deadlock shape from the
+    #45 cycle (impl waits for review, reviewer waits for impl=done). The
+    block must be older than ``threshold_seconds``.
+
+    Idempotent: a card that already has a ``chain_stuck_alarm`` newer than
+    its most recent ``blocked`` event is skipped, so repeated ticks emit at
+    most one alarm per stuck episode (a re-block after unblock re-arms it).
+
+    ``threshold_seconds <= 0`` disables detection (no-op). Default OFF.
+    """
+    try:
+        threshold = int(threshold_seconds)
+    except (TypeError, ValueError):
+        return []
+    if threshold <= 0:
+        return []
+    now = int(now if now is not None else time.time())
+    cutoff = now - threshold
+    alarms: list[tuple[str, str]] = []
+    # Candidate reviewer cards: currently blocked, with a sticky block.
+    blocked_rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked'"
+    ).fetchall()
+    for row in blocked_rows:
+        tid = row["id"]
+        if not _has_sticky_block(conn, tid):
+            continue
+        # Parent(s) must contain at least one done impl-card.
+        parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?",
+            (tid,),
+        ).fetchall()
+        if not any(p["status"] == "done" for p in parents):
+            continue
+        # Age of the most recent block event.
+        block_ev = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        if block_ev is None or int(block_ev["created_at"]) > cutoff:
+            continue
+        blocked_at = int(block_ev["created_at"])
+        # Idempotency: skip if a chain_stuck_alarm already fired after the
+        # most recent block.
+        last_alarm = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'chain_stuck_alarm' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        if last_alarm is not None and int(last_alarm["created_at"]) >= blocked_at:
+            continue
+        age_h = round((now - blocked_at) / 3600.0, 1)
+        reason = (
+            f"impl→review chain stuck: reviewer card blocked for {age_h}h "
+            f"with a done impl-parent. Needs Petro."
+        )
+        with write_txn(conn):
+            _append_event(
+                conn, tid, "chain_stuck_alarm",
+                {"age_seconds": now - blocked_at, "reason": reason},
+            )
+        alarms.append((tid, reason))
+    return alarms
+
+
+# ---------------------------------------------------------------------------
+# Infra-queue feature 1: auto-rework level 2 (auto-respawn on review-block)
+# ---------------------------------------------------------------------------
+
+_AUTO_REWORK_DEFAULT_MAX = 2
+
+# Default stop-list: a match in the impl/reviewer body escalates instead of
+# auto-reworking. RU + EN. Overridable via the dispatcher kwarg.
+_AUTO_REWORK_STOP_KEYWORDS = (
+    "budget", "бюджет", "secret", "секрет", "prod-db", "прод-бд",
+    "migration", "миграц", "nginx", "approve", "апрув", "deploy", "деплой",
+)
+
+# A reviewer block is a *content* review-block (reworkable) when its reason
+# matches this marker OR comes from a reviewer lane. Infra failures
+# (auth/quota/crash) are excluded by the _RESPAWN_BLOCKER_RE check.
+_REVIEW_BLOCK_MARKER_RE = re.compile(
+    r"review[\s\-]?(?:block|blocking|required)", re.IGNORECASE
+)
+
+
+def _get_auto_rework_count(conn: sqlite3.Connection, impl_id: str) -> int:
+    """Return how many auto-reworks have run on this impl chain."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'auto_reworked'",
+        (impl_id,),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def _set_auto_rework_count(
+    conn: sqlite3.Connection, impl_id: str, count: int
+) -> None:
+    """Test/seed helper: stamp ``count`` auto_reworked events on the chain.
+
+    Used by tests to simulate prior auto-rework attempts. Production code
+    increments naturally by emitting one ``auto_reworked`` event per cycle.
+    """
+    existing = _get_auto_rework_count(conn, impl_id)
+    with write_txn(conn):
+        for _ in range(max(0, count - existing)):
+            _append_event(conn, impl_id, "auto_reworked", {"seed": True})
+
+
+def _gh_pr_status(pr_url: str) -> Optional[dict]:
+    """Query a PR's draft/label/state via ``gh``. Returns None on failure.
+
+    Shape: ``{"isDraft": bool, "labels": [str], "state": "OPEN"|...}``.
+    Tests inject a stub via ``pr_check_fn`` so this never shells out under
+    test.
+    """
+    m = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", pr_url)
+    if not m:
+        return None
+    repo = f"{m.group(1)}/{m.group(2)}"
+    num = m.group(3)
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", num, "--repo", repo,
+             "--json", "isDraft,labels,state"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode != 0:
+            return None
+        data = json.loads(out.stdout or "{}")
+        return {
+            "isDraft": bool(data.get("isDraft")),
+            "labels": [
+                (lbl.get("name") if isinstance(lbl, dict) else lbl)
+                for lbl in (data.get("labels") or [])
+            ],
+            "state": data.get("state"),
+        }
+    except Exception:
+        return None
+
+
+def _find_pr_url_in_comments(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Return the most recent GitHub PR URL mentioned in this card's comments."""
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ).fetchall():
+        if not c["body"]:
+            continue
+        m = _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+        if m:
+            return m.group(0)
+    return None
+
+
+def maybe_auto_rework(
+    conn: sqlite3.Connection,
+    *,
+    enabled: bool = False,
+    max_attempts: int = _AUTO_REWORK_DEFAULT_MAX,
+    require_draft_pr: bool = True,
+    stop_keywords: Optional[Iterable[str]] = None,
+    pr_check_fn=None,
+) -> list[str]:
+    """Auto-create rework cards for reviewer-blocked impl chains (level 2).
+
+    Scans cards in ``blocked`` whose latest block is a *content* review-block
+    (not an infra/auth failure), and — when all 7 safety gates pass —
+    creates a new rework card on the SAME branch as the impl-parent, links
+    it under the reviewer, and increments the chain's auto-rework count.
+
+    The 7 gates (all must hold):
+      1. ``enabled`` (global kill-switch). Default OFF.
+      2. Source is a content review-block: reason matches the review marker
+         and does NOT match ``_RESPAWN_BLOCKER_RE`` (auth/quota/infra).
+      3. Reviewer card has an impl-parent carrying a ``branch_name``.
+      4. A Draft PR exists (isDraft + ``do-not-merge`` label + OPEN), when
+         ``require_draft_pr``. Non-Draft / merged / missing → escalate.
+      5. Auto-rework count on the impl chain < ``max_attempts``.
+      6. No stop-list keyword in impl OR reviewer body.
+      7. Idempotency: no rework already created for THIS block episode.
+
+    On any blocking gate (count exhausted / stop-list / non-Draft PR) emits
+    ``auto_rework_exhausted`` and leaves the reviewer blocked for a human.
+
+    Returns the list of created rework-card ids.
+    """
+    if not enabled:
+        return []
+    try:
+        limit = int(max_attempts)
+    except (TypeError, ValueError):
+        limit = _AUTO_REWORK_DEFAULT_MAX
+    stops = tuple(
+        s.lower() for s in (stop_keywords or _AUTO_REWORK_STOP_KEYWORDS)
+    )
+    check = pr_check_fn if pr_check_fn is not None else _gh_pr_status
+    created: list[str] = []
+
+    blocked_rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked'"
+    ).fetchall()
+    for row in blocked_rows:
+        rev_id = row["id"]
+        # Gate 2a: must be sticky-blocked (deliberate handoff).
+        if not _has_sticky_block(conn, rev_id):
+            continue
+        block_ev = conn.execute(
+            "SELECT id, created_at, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY id DESC LIMIT 1",
+            (rev_id,),
+        ).fetchone()
+        if block_ev is None:
+            continue
+        reason = ""
+        try:
+            payload = json.loads(block_ev["payload"]) if block_ev["payload"] else {}
+            reason = str(payload.get("reason") or "")
+        except Exception:
+            reason = ""
+        # Gate 2b: content review-block, not infra/auth.
+        if _RESPAWN_BLOCKER_RE.search(reason):
+            continue
+        if not _REVIEW_BLOCK_MARKER_RE.search(reason):
+            continue
+        # Gate 7: idempotency — skip if a rework already exists for this block.
+        last_rework = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'auto_rework_started' "
+            "ORDER BY id DESC LIMIT 1",
+            (rev_id,),
+        ).fetchone()
+        if last_rework is not None and int(last_rework["created_at"]) >= int(block_ev["created_at"]):
+            continue
+        # Gate 3: impl-parent with a branch_name.
+        impl = conn.execute(
+            "SELECT t.id, t.assignee, t.branch_name, t.body, t.skills, t.tenant "
+            "FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ? AND t.branch_name IS NOT NULL "
+            "ORDER BY t.created_at DESC LIMIT 1",
+            (rev_id,),
+        ).fetchone()
+        if impl is None:
+            continue
+        impl_id = impl["id"]
+        impl_body = impl["body"] or ""
+        rev_body = conn.execute(
+            "SELECT body FROM tasks WHERE id = ?", (rev_id,)
+        ).fetchone()["body"] or ""
+
+        def _escalate(why: str) -> None:
+            with write_txn(conn):
+                _append_event(
+                    conn, rev_id, "auto_rework_exhausted",
+                    {"reason": why, "impl": impl_id},
+                )
+
+        # Gate 6: stop-list.
+        haystack = (impl_body + "\n" + rev_body).lower()
+        if any(kw in haystack for kw in stops):
+            _escalate("stop-list keyword present")
+            continue
+        # Gate 5: attempt count.
+        count = _get_auto_rework_count(conn, impl_id)
+        if count >= limit:
+            _escalate(f"max auto-rework attempts reached ({count}/{limit})")
+            continue
+        # Gate 4: Draft PR.
+        pr_url = _find_pr_url_in_comments(conn, impl_id) or _find_pr_url_in_comments(conn, rev_id)
+        if require_draft_pr:
+            if not pr_url:
+                _escalate("no PR URL found for Draft check")
+                continue
+            status = check(pr_url)
+            if not status:
+                _escalate("PR status unavailable")
+                continue
+            labels = [str(x).lower() for x in (status.get("labels") or [])]
+            if not (
+                status.get("isDraft")
+                and status.get("state") == "OPEN"
+                and "do-not-merge" in labels
+            ):
+                _escalate("PR not Draft+do-not-merge+OPEN")
+                continue
+
+        # All gates passed — create the rework card.
+        brief = (
+            f"RETRY (auto-rework #{count + 1}/{limit}): reviewer blocked "
+            f"PR {pr_url or '(unknown)'}. Continue branch "
+            f"`{impl['branch_name']}` — do NOT open a new PR. Reviewer "
+            f"block: {reason or '(see reviewer card)'}. Close the finding, "
+            f"update `## AC tested` / `## Evidence`, keep Draft + "
+            f"do-not-merge."
+        )
+        skills_val = None
+        try:
+            skills_val = json.loads(impl["skills"]) if impl["skills"] else None
+        except Exception:
+            skills_val = None
+        rework_id = create_task(
+            conn,
+            title=f"Auto-rework #{count + 1}: {reason[:60] or 'review block'}",
+            body=brief,
+            assignee=impl["assignee"],
+            created_by="auto-rework",
+            workspace_kind="worktree",
+            branch_name=impl["branch_name"],
+            tenant=impl["tenant"],
+            skills=skills_val,
+            max_retries=1,
+            initial_status="running",
+        )
+        with write_txn(conn):
+            # Reviewer gains the rework as a new parent (re-gate on it).
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (rework_id, rev_id),
+            )
+            _append_event(
+                conn, rev_id, "auto_rework_started",
+                {"rework_id": rework_id, "count": count + 1, "impl": impl_id},
+            )
+            _append_event(
+                conn, impl_id, "auto_reworked",
+                {"rework_id": rework_id, "count": count + 1, "reviewer": rev_id},
+            )
+        created.append(rework_id)
+    return created
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -6125,6 +6567,12 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    done_archive_days: int = 0,
+    stuck_chain_alarm_seconds: int = 0,
+    auto_rework_enabled: bool = False,
+    auto_rework_max_attempts: int = _AUTO_REWORK_DEFAULT_MAX,
+    auto_rework_require_draft_pr: bool = True,
+    auto_rework_stop_keywords: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6499,6 +6947,42 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    # ---- infra-queue feature 1: auto-rework level 2 ----
+    # Auto-create rework cards for reviewer-blocked impl chains. All gates
+    # default-safe; the whole block is a no-op unless auto_rework_enabled.
+    if auto_rework_enabled and not dry_run:
+        try:
+            result.auto_reworked = maybe_auto_rework(
+                conn,
+                enabled=True,
+                max_attempts=auto_rework_max_attempts,
+                require_draft_pr=auto_rework_require_draft_pr,
+                stop_keywords=auto_rework_stop_keywords,
+            )
+        except Exception:
+            _log.exception("kanban dispatch: maybe_auto_rework failed")
+
+    # ---- infra-queue feature 2: stuck impl→review chain detector ----
+    # Alarm-only. No-op unless stuck_chain_alarm_seconds > 0.
+    if stuck_chain_alarm_seconds and stuck_chain_alarm_seconds > 0 and not dry_run:
+        try:
+            result.stuck_chains = detect_stuck_chains(
+                conn, threshold_seconds=stuck_chain_alarm_seconds,
+            )
+        except Exception:
+            _log.exception("kanban dispatch: detect_stuck_chains failed")
+
+    # ---- infra-queue feature 3: auto-archive stale Done ----
+    # No-op unless done_archive_days > 0.
+    if done_archive_days and done_archive_days > 0 and not dry_run:
+        try:
+            result.archived = auto_archive_old_done(
+                conn, archive_after_days=done_archive_days,
+            )
+        except Exception:
+            _log.exception("kanban dispatch: auto_archive_old_done failed")
+
     return result
 
 

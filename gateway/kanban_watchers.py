@@ -128,7 +128,7 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "chain_stuck_alarm")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -341,6 +341,18 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "chain_stuck_alarm":
+                            # Infra-queue feature 2 (П.2 layer 2): a reviewer
+                            # card sat sticky-blocked past
+                            # kanban.stuck_chain_alarm_seconds while its impl
+                            # parent is done. Alarm only — needs a human.
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:200]}"
+                            msg = (
+                                f"🚨 {tag}Kanban {sub['task_id']} stuck "
+                                f"impl→review chain{reason}"
                             )
                         else:
                             continue
@@ -796,6 +808,75 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Infra-queue feature 3 (П.3): auto-archive Done cards older than N
+        # days. Default 0 = disabled (the board keeps every Done card until
+        # an operator archives it). Opt-in via kanban.done_archive_days.
+        try:
+            done_archive_days = int(kanban_cfg.get("done_archive_days", 0) or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.done_archive_days=%r; disabling",
+                kanban_cfg.get("done_archive_days"),
+            )
+            done_archive_days = 0
+        if done_archive_days < 0:
+            done_archive_days = 0
+        if done_archive_days:
+            logger.info(
+                "kanban dispatcher: auto-archive Done older than %d day(s)",
+                done_archive_days,
+            )
+
+        # Infra-queue feature 2 (П.2 layer 2): stuck impl→review chain
+        # detector. Default 0 = disabled. Opt-in via
+        # kanban.stuck_chain_alarm_seconds (alarm only — never auto-fixes).
+        try:
+            stuck_chain_alarm_seconds = int(
+                kanban_cfg.get("stuck_chain_alarm_seconds", 0) or 0
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.stuck_chain_alarm_seconds=%r; disabling",
+                kanban_cfg.get("stuck_chain_alarm_seconds"),
+            )
+            stuck_chain_alarm_seconds = 0
+        if stuck_chain_alarm_seconds < 0:
+            stuck_chain_alarm_seconds = 0
+        if stuck_chain_alarm_seconds:
+            logger.info(
+                "kanban dispatcher: stuck-chain alarm after %ds",
+                stuck_chain_alarm_seconds,
+            )
+
+        # Infra-queue feature 1: auto-rework level 2. Default OFF
+        # (kanban.auto_rework.enabled). When enabled, a reviewer-blocked
+        # impl chain auto-spawns a rework card on the same branch, up to
+        # max_attempts, then escalates to a human.
+        auto_rework_cfg = kanban_cfg.get("auto_rework", {})
+        if not isinstance(auto_rework_cfg, dict):
+            auto_rework_cfg = {}
+        auto_rework_enabled = bool(auto_rework_cfg.get("enabled", False))
+        try:
+            auto_rework_max_attempts = int(auto_rework_cfg.get("max_attempts", 2) or 2)
+        except (TypeError, ValueError):
+            auto_rework_max_attempts = 2
+        if auto_rework_max_attempts < 1:
+            auto_rework_max_attempts = 1
+        auto_rework_require_draft_pr = bool(
+            auto_rework_cfg.get("require_draft_pr", True)
+        )
+        _raw_stop = auto_rework_cfg.get("stop_keywords")
+        auto_rework_stop_keywords = (
+            list(_raw_stop) if isinstance(_raw_stop, (list, tuple)) and _raw_stop
+            else None
+        )
+        if auto_rework_enabled:
+            logger.info(
+                "kanban dispatcher: auto-rework L2 enabled (max_attempts=%d, "
+                "require_draft_pr=%s)",
+                auto_rework_max_attempts, auto_rework_require_draft_pr,
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -889,6 +970,12 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    done_archive_days=done_archive_days,
+                    stuck_chain_alarm_seconds=stuck_chain_alarm_seconds,
+                    auto_rework_enabled=auto_rework_enabled,
+                    auto_rework_max_attempts=auto_rework_max_attempts,
+                    auto_rework_require_draft_pr=auto_rework_require_draft_pr,
+                    auto_rework_stop_keywords=auto_rework_stop_keywords,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1110,6 +1197,22 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                    # Infra-queue side effects (auto-archive / stuck-chain
+                    # alarm / auto-rework). Each is empty unless its config
+                    # key is enabled, so an idle board stays silent.
+                    if res is not None:
+                        archived = getattr(res, "archived", None) or []
+                        stuck_chains = getattr(res, "stuck_chains", None) or []
+                        auto_reworked = getattr(res, "auto_reworked", None) or []
+                        if archived or stuck_chains or auto_reworked:
+                            logger.info(
+                                "kanban dispatcher [%s]: archived=%d "
+                                "stuck_chains=%d auto_reworked=%d",
+                                slug,
+                                len(archived),
+                                len(stuck_chains),
+                                len(auto_reworked),
+                            )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if ready_pending and not any_spawned:
