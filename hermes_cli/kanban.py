@@ -50,6 +50,33 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+# Profiles that only ORCHESTRATE (route/plan) the task while the actual code is
+# written by a delegated executor. The board/runs output otherwise shows the
+# orchestrator's model (e.g. ultracode = gpt-5.5), which is repeatedly misread
+# as "the coder". The badge clarifies the real code executor. Cosmetic only —
+# nothing here changes how work is executed.
+_ORCHESTRATOR_CODE_EXECUTOR = {
+    "ultracode": "opus via ultracode-run",
+}
+
+
+def _code_executor_badge(profile: Optional[str], metadata: Optional[dict]) -> str:
+    """Return a ``" → code: <executor>"`` suffix for orchestrator profiles.
+
+    Precedence:
+      1. explicit ``metadata["executor"]`` stamped by the worker at delegation
+         time (authoritative — survives config drift);
+      2. the static ``_ORCHESTRATOR_CODE_EXECUTOR`` map keyed by profile name.
+    Returns ``""`` for normal profiles that write code directly.
+    """
+    executor = None
+    if isinstance(metadata, dict):
+        executor = metadata.get("executor") or metadata.get("code_executor")
+    if not executor and profile:
+        executor = _ORCHESTRATOR_CODE_EXECUTOR.get(profile.strip().lower())
+    return f" → code: {executor}" if executor else ""
+
+
 def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
@@ -1606,7 +1633,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
                        if r.ended_at else None)
             el = f"{elapsed}s" if elapsed is not None else "active"
             outcome = r.outcome or r.status or "active"
-            print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  "
+            prof = r.profile or "-"
+            # Orchestrator profiles only ROUTE the task; the code is written by a
+            # delegated executor (e.g. ultracode = gpt-5.5 orchestrator that
+            # delegates code to Claude Opus via /home/dev/bin/ultracode-run). Show
+            # the real code executor so the profile model isn't misread as "the
+            # coder" (cosmetic; does not change execution).
+            exec_badge = _code_executor_badge(prof, r.metadata)
+            prof_disp = f"{prof}{exec_badge}"
+            print(f"  #{r.id:<3} {outcome:<12} @{prof_disp}  {el}  "
                   f"{_fmt_ts(r.started_at)}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
@@ -2514,6 +2549,13 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             el = f"{elapsed / 3600:.1f}h"
         outcome = r.outcome or ("(running)" if not r.ended_at else r.status)
         print(f"{i:3d}  {outcome:12s}  {(r.profile or '-'):16s}  {el:>8s}  {_fmt_ts(r.started_at)}")
+        # For orchestrator profiles (e.g. ultracode = gpt-5.5 router that
+        # delegates code to Claude Opus via ultracode-run), the PROFILE column
+        # shows the router, not the coder. Surface the real code executor on its
+        # own line so it isn't misread. Cosmetic; execution is unchanged.
+        exec_badge = _code_executor_badge(r.profile, r.metadata)
+        if exec_badge:
+            print(f"     ⚙{exec_badge}")
         if r.summary:
             # Indent and truncate long summaries to keep the table readable.
             summary = r.summary.splitlines()[0][:100]
