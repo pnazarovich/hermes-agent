@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import asdict
@@ -153,6 +154,17 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+
+# Done-column visible cap (infra-fix П.3). The Done pile grows unbounded;
+# without a cap the board slurps every completed card and recent work drowns.
+# We sort Done newest-first and show at most this many unless ?include_archived
+# is set. 0 disables the cap (show all). Configurable via env so ops can tune
+# it without a code edit.
+try:
+    _DONE_VISIBLE_LIMIT = int(os.environ.get("HERMES_KANBAN_DONE_VISIBLE", "25"))
+except (TypeError, ValueError):
+    _DONE_VISIBLE_LIMIT = 25
 
 
 def _task_dict(
@@ -478,8 +490,25 @@ def get_board(
             col = t.status if t.status in columns else "todo"
             columns[col].append(d)
 
-        # Stable per-column ordering already applied by list_tasks
-        # (priority DESC, created_at ASC), keep as-is.
+        # Done-column hygiene (infra-fix П.3): list_tasks orders by
+        # (priority DESC, created_at ASC), which sinks the freshest completions
+        # to the BOTTOM of an ever-growing Done pile so recent work is hidden.
+        # Re-sort Done newest-first (by completion time, falling back to
+        # created_at) and cap the visible count; the overflow stays reachable
+        # via include_archived / the retention archiver. Other columns keep
+        # their stable list_tasks order. Cosmetic read-side only — no task
+        # state is mutated here.
+        _done = columns.get("done")
+        if _done:
+            _done.sort(key=lambda c: c.get("completed_at") or c.get("created_at") or 0,
+                       reverse=True)
+            done_total = len(_done)
+            if not include_archived and _DONE_VISIBLE_LIMIT > 0:
+                columns["done"] = _done[:_DONE_VISIBLE_LIMIT]
+            done_hidden = done_total - len(columns["done"])
+        else:
+            done_total = 0
+            done_hidden = 0
 
         # List of known tenants for the UI filter dropdown.
         tenants = [
@@ -505,6 +534,12 @@ def get_board(
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+            # Done-column cap telemetry (П.3): lets the UI render a
+            # "+N earlier — show all" affordance and lets ops confirm the
+            # cap is active without reading code.
+            "done_total": done_total,
+            "done_hidden": done_hidden,
+            "done_visible_limit": _DONE_VISIBLE_LIMIT,
         }
     finally:
         conn.close()
