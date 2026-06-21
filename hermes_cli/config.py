@@ -2366,6 +2366,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Wake a real agent turn when a card reaches a terminal event, in
+        # addition to the one-way notifier ping. Default OFF. When on, only
+        # ``completed`` and ``blocked`` events wake the agent (the other
+        # terminal kinds — gave_up / crashed / timed_out / chain_stuck_alarm —
+        # stay one-way-only). The wake fires at most once per (task_id, event)
+        # via the notifier cursor, and never on agent-authored ``commented``
+        # events, so the agent's own follow-up comment can't trigger a loop.
+        "wake_agent_on_terminal": False,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

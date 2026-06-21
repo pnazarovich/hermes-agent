@@ -138,6 +138,14 @@ class GatewayKanbanWatchersMixin:
             or "en"
         ).strip().lower()
         simple_russian = notification_language in {"ru", "rus", "russian", "русский"}
+        # Wake-on-terminal: in addition to the one-way ping, dispatch a
+        # real agent turn for completed/blocked events. Default OFF. Only
+        # those two kinds wake; the cursor advance (after each sub's events
+        # are processed) makes the wake fire at most once per (task, event).
+        wake_agent_on_terminal = self._kanban_truthy(
+            kanban_cfg.get("wake_agent_on_terminal")
+        )
+        WAKE_KINDS = frozenset({"completed", "blocked"})
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -364,6 +372,29 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                            # Wake a real agent turn for completed/blocked
+                            # events when the feature is on (in ADDITION to
+                            # the one-way ping just sent). Guarded to the two
+                            # wake kinds only; never on agent-authored
+                            # ``commented`` events (not in TERMINAL_KINDS, so
+                            # never claimed here) — prevents a comment→wake
+                            # →comment loop. Idempotent via the same cursor
+                            # that dedups the ping.
+                            if wake_agent_on_terminal and kind in WAKE_KINDS:
+                                try:
+                                    await self._kanban_wake_agent(
+                                        adapter=adapter,
+                                        sub=sub,
+                                        task=task,
+                                        title=title,
+                                        kind=kind,
+                                        event=ev,
+                                    )
+                                except Exception as wake_exc:
+                                    logger.warning(
+                                        "kanban notifier: wake-agent for %s (%s) failed: %s",
+                                        sub["task_id"], kind, wake_exc,
+                                    )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -531,6 +562,99 @@ class GatewayKanbanWatchersMixin:
             ]]
         }
         return msg, metadata
+
+    async def _kanban_wake_agent(
+        self,
+        *,
+        adapter,
+        sub: dict,
+        task,
+        title: str,
+        kind: str,
+        event,
+    ) -> None:
+        """Dispatch a synthetic agent turn for a terminal kanban event.
+
+        Mirrors the CLI-handoff / webhook synthetic-event pattern: build a
+        ``MessageEvent`` whose source carries the *real* subscribed
+        ``chat_id`` / ``thread_id`` (so the agent's reaction is delivered
+        back into the subscribed topic), mark it ``internal=True`` so it
+        bypasses user-authorization, give it a distinct synthetic message
+        id (``kanban:{task_id}:{event_id}``) for attribution, and fire it
+        through the adapter's ``handle_message`` as a background task so the
+        notifier loop never blocks on the turn.
+
+        Only called for ``completed`` / ``blocked`` (see ``WAKE_KINDS``),
+        and only for newly-claimed events, so it is idempotent per
+        (task, event) via the notifier cursor.
+        """
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        task_id = sub["task_id"]
+        event_payload = getattr(event, "payload", None)
+        event_id = getattr(event, "id", None)
+        # Reuse the notifier's own field extraction so the wake prompt and
+        # the one-way ping describe the same facts.
+        summary = self._kanban_handoff_text(event_payload, task)
+        if kind == "completed":
+            urls = self._kanban_urls_from_payload(event_payload, summary)
+            pr_url = None
+            if isinstance(event_payload, dict):
+                pr_url = event_payload.get("pr_url")
+            pr_url = pr_url or (urls[0] if urls else None)
+            text = (
+                f"Kanban-карточка {task_id} завершена ({title}). "
+                f"Итог: {summary or '—'}. PR: {pr_url or '—'}. "
+                f"Проверь результат и двинь дальше "
+                f"(ревью/merge-gate/следующий шаг) по правилам "
+                f"intake-routing."
+            )
+        else:  # blocked
+            reason = None
+            if isinstance(event_payload, dict):
+                reason = event_payload.get("reason")
+            text = (
+                f"Kanban-карточка {task_id} заблокирована ({title}). "
+                f"Причина: {reason or summary or '—'}. Разберись и "
+                f"предложи/выполни решение по правилам intake-routing."
+            )
+
+        # Distinct synthetic id for attribution/dedup. Kept off chat_id so
+        # the reply still routes to the real subscribed topic (Telegram has
+        # no webhook-style delivery indirection — source.chat_id IS the
+        # send target).
+        synth_msg_id = f"kanban:{task_id}:{event_id}" if event_id is not None else f"kanban:{task_id}"
+        thread_id = sub.get("thread_id") or None
+        chat_type = "group" if thread_id else "dm"
+        source = adapter.build_source(
+            chat_id=sub["chat_id"],
+            chat_name=f"kanban/{task_id}",
+            chat_type=chat_type,
+            user_id="system:kanban",
+            user_name="Kanban",
+            thread_id=thread_id,
+            message_id=synth_msg_id,
+        )
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if notifier_profile:
+            source.profile = notifier_profile
+        synth_event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=event_payload,
+            message_id=synth_msg_id,
+            internal=True,
+        )
+        logger.info(
+            "kanban notifier: waking agent for %s event=%s chat=%s thread=%s msg=%s",
+            task_id, kind, sub["chat_id"], thread_id, synth_msg_id,
+        )
+        wake_task = asyncio.create_task(adapter.handle_message(synth_event))
+        bg = getattr(self, "_background_tasks", None)
+        if bg is not None:
+            bg.add(wake_task)
+            wake_task.add_done_callback(bg.discard)
 
     def _format_kanban_terminal_notification(
         self,
